@@ -42,3 +42,6 @@ state.yaml
 .env
 .env.*
 !.env.example
+
+# --- Binário antigo (pré-rename lsm → erp24) ---
+/lsm

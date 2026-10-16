@@ -17,7 +17,7 @@ bash dispersos por:
 - Menu interativo quando corrido sem args (`sudo erp24`).
 - Wizard automático no primeiro arranque (sem config).
 - Estado em ficheiro YAML, sincronizado com UFW.
-- Distribuído como `.deb` via GitHub Actions.
+- Distribuído como `.deb` (nfpm) publicado por MyPublisher em GitHub Releases.
 
 **Foco:** servidor Debian para correr containers (Docker engine rootful) +
 acesso controlado por whitelist de IPs.
@@ -31,8 +31,8 @@ acesso controlado por whitelist de IPs.
 2. Refactorizado para `/Users/pedro/Desktop/Debian/` — modular bash com
    `setup.sh` orquestrador + `modules/01-firewall.sh`, `02-ssh.sh`, etc.
 3. MySQL removido (app-specific, não base server).
-4. Convertido para Go em `/Users/pedro/Desktop/erp24/` — projeto atual.
-5. Vai ser publicado em GitHub repo próprio (owner: pedro / erp24).
+4. Convertido para Go — projeto atual (`/Users/pedro/Projects/LittleServerManager`).
+5. Público em https://github.com/santospedro1993/LittleServerManager.
 
 ---
 
@@ -77,8 +77,11 @@ erp24/
 ├── README.md                  # docs públicas (PT)
 ├── CLAUDE.md                  # este ficheiro
 ├── config.example.yaml        # template, vai para /etc/erp24/ no .deb
-├── .github/workflows/
-│   └── release.yml            # workflow_dispatch → tag + .deb release
+├── nfpm.yaml                  # empacotamento .deb (amd64/arm64)
+├── packaging/postinstall.sh   # postinst do .deb (LF obrigatório)
+├── .gitattributes             # *.sh / *.service eol=lf (MyPublisher corre em Windows)
+├── .mypublisher/workflows/
+│   └── producao.yml           # build + nfpm + tag + GitHub Release
 ├── cmd/                       # cobra subcommands
 │   ├── root.go                # rootCmd + flags globais + shouldOpen()
 │   ├── menu.go                # menu interativo + runAllModules + helpers
@@ -93,12 +96,16 @@ erp24/
 │   ├── upgrades.go            # unattended-upgrades
 │   ├── timesync.go            # parent + sub-cmds: sync, status
 │   ├── sysctl.go              # /etc/sysctl.d/99-erp24.conf
-│   └── hostname.go            # hostnamectl + /etc/hosts
+│   ├── hostname.go            # hostnamectl + /etc/hosts
+│   ├── sentinel.go            # instala + regista agente Sentinel (opt-in)
+│   ├── port.go                # port add/remove/allow/revoke/list
+│   ├── status.go              # métricas do host (--live)
+│   └── system.go              # system update / reboot (+ alias update-server)
 └── internal/
     ├── config/config.go       # Config struct + Load/Save + IP add/remove
     ├── state/state.go         # State struct + ManagedPort + Add/Remove
     ├── prompt/prompt.go       # Ask, AskInt, AskIPOrCIDR, Confirm, Choose
-    ├── runner/runner.go       # Run, Capture, Stdin, DryRun, RequireRoot
+    ├── runner/runner.go       # Run, Capture, Stdin, TryRun, AptGet/TryAptGet, RunEnv, DryRun, RequireRoot
     ├── ufw/ufw.go             # Install, Allow*, Delete*, OpenWhitelisted
     ├── ssh/ssh.go             # CreateUser, Harden, OpenFirewall
     ├── docker/docker.go       # RemoveConflicts, InstallRepo, InstallEngine, EnableDaemon
@@ -106,7 +113,10 @@ erp24/
     ├── upgrades/upgrades.go   # Install, EnablePeriodic
     ├── timesync/timesync.go   # SetTimezone, Enable, ForceSync, Synced, NTPEnabled
     ├── sysctl/sysctl.go       # Body (const), Write, Apply, Get, Expected
-    └── hostname/hostname.go   # Set, UpdateHosts, Apply, Current
+    ├── hostname/hostname.go   # Set, UpdateHosts, Apply, Current
+    ├── sentinel/sentinel.go   # Installed, Registered, NormalizeCentral, Run
+    ├── sysstat/sysstat.go     # CPU/RAM/disk/net a partir de /proc e /sys
+    └── sysupdate/sysupdate.go # apt update/upgrade, needrestart, reboot pendente/agendado
 ```
 
 ---
@@ -118,6 +128,7 @@ Whitelist de IPs **NÃO** está aqui (lê-se direto do UFW). Password SSH **NÃO
 está aqui (pedida em runtime quando o user é criado).
 
 ```yaml
+schema_version: 1                # ausente = legacy v0 (ver abaixo)
 timezone: Etc/UTC                # default se omitido
 hostname: srv01                  # opcional; vazio → módulo hostname não corre
 fqdn: srv01.exemplo.com          # opcional
@@ -128,6 +139,9 @@ ssh:
 
 network:
   auto_open_ports: ask           # true | false | ask
+
+sentinel:
+  central_url: https://cc.erp24.pt   # só usado se modules.sentinel: true
 
 # Quais módulos opcionais correr em `erp24 all` e na pós-wizard auto-run.
 # firewall + ssh são sempre true (baseline de segurança); chamadas
@@ -141,12 +155,15 @@ modules:
   docker: true                   # único opt-in pedido no wizard
   fail2ban: true
   upgrades: true
+  sentinel: false                # opt-in (como docker)
 ```
 
 Campos com default em `internal/config/config.go::validate()`. Required ones
-falham com erro explícito. Configs antigos sem bloco `modules:` são tratados
-como legacy: se TODAS as flags opcionais ficarem `false` após unmarshal,
-`validate()` força tudo a `true` para não perder módulos silenciosamente.
+falham com erro explícito. Configs sem `schema_version` (v0, legacy) têm as
+flags baseline + docker forçadas a `true` para não perder módulos
+silenciosamente — **sentinel fica `false`** (não se regista um agente à
+socapa; precisa de install key). `CurrentSchemaVersion` sobe quando o layout
+muda.
 
 ---
 
@@ -177,6 +194,7 @@ installed_modules:
   - docker
   - fail2ban
   - upgrades
+  - sentinel
 ```
 
 Cada módulo que abre porta whitelisted **deve** registar via
@@ -196,6 +214,10 @@ Padrão obrigatório (segue ssh.go ou fail2ban.go como template):
    - `Enable() error`
    - `Status()` ou similar (read-only, p/ validate)
    - **Idempotente**. Usa `runner.Run/Capture/Stdin`. Devolve `error`.
+   - **apt sempre via `runner.AptGet(...)` / `TryAptGet(...)`** (só os
+     subargs, sem `"apt-get"`): espera pelo lock e corre não-interativo.
+     Nunca `runner.Run("apt-get", ...)` — num Debian acabado de arrancar o
+     apt-daily prende o lock e dá exit 100.
 
 2. **`cmd/X.go`** — cobra subcommand:
    ```go
@@ -203,7 +225,7 @@ Padrão obrigatório (segue ssh.go ou fail2ban.go como template):
        Use:   "X",
        Short: "...",
        RunE: func(cmd *cobra.Command, args []string) error {
-           if err := runner.RequireRoot(); err != nil { return err }
+           if err := RequireAdmin(); err != nil { return err }
            cfg, err := config.Load(cfgFile)
            if err != nil { return err }
            runner.Section("X: ...")
@@ -214,10 +236,12 @@ Padrão obrigatório (segue ssh.go ou fail2ban.go como template):
    func init() { rootCmd.AddCommand(XCmd) }
    ```
 
-3. **`cmd/menu.go`** — adiciona ao `chooseAndRunModule()` (interativo) e
-   `runAllModules()` (com `skip:` se depender de config opcional).
+3. **`cmd/menu.go`** — dois sítios: `runAllModules()` (slice `mods`, respeita
+   `cfg.Modules.<X>`) e `modulesMenu()` (lista + switch; ao inserir antes de
+   "all" corrige os números).
 
-4. **`cmd/validate.go`** — adiciona checks (`check("nome", bool, "detalhe")`).
+4. **`cmd/validate.go`** — `if st.IsInstalled("X") { check(...) } else { skip(...) }`
+   + entrada em `moduleRunners()` (para o Check & Fix).
 
 5. Se introduzir campo novo no config:
    - `internal/config/config.go::Config` struct (yaml tag).
@@ -230,7 +254,14 @@ Padrão obrigatório (segue ssh.go ou fail2ban.go como template):
 7. Atualiza este `CLAUDE.md` (secção 9 — lista de módulos).
 
 8. **Não** mudes a ordem em `runAllModules` sem perceber dependências
-   (firewall sempre primeiro; ssh depois de firewall; docker antes de fail2ban).
+   (firewall sempre primeiro; ssh depois de firewall; docker antes de
+   fail2ban e sentinel).
+
+Armadilhas: dentro de um `*Cmd` nunca referir `rootCmd` (init cycle — usar
+`appVersion`); segredos nunca no config (pedir em runtime com
+`prompt.AskPassword`); em `--dry-run` `runner.Capture` devolve `""` e chamadas
+HTTP têm de ser saltadas à mão; módulo opt-in não pode ficar `true` na
+migração legacy v0.
 
 ---
 
@@ -249,7 +280,8 @@ Sequência quando `sudo erp24` corre e `/etc/erp24/config.yaml` não existe
 2. Se há reboot pendente → prompt 3-way (now / 04:00 / defer). Em
    qualquer escolha, erp24 sai. Re-correr depois retoma daqui.
 3. Wizard (timezone — default `Etc/UTC` —, hostname, ssh user/port,
-   política `auto_open_ports`, **só docker como opt-in**).
+   política `auto_open_ports`, **docker e sentinel como opt-in** — sentinel
+   pede também o `central_url`).
    firewall + ssh + sysctl + timesync + fail2ban + upgrades são baseline
    incondicional (`true`). hostname é baseline **condicional**: a flag é
    `c.Hostname != ""` — se o user deixou o hostname vazio no wizard, o
@@ -273,6 +305,7 @@ em bootstrap.
 | 6 | `docker` | Remove conflitos, install Docker CE (engine + cli + containerd + buildx + compose plugin), `systemctl enable --now docker.service` | — |
 | 7 | `fail2ban` | Install, escreve `jail.local` (port=ssh.port, ignoreip = `ufw.SpecificSources` da porta SSH) | `ssh.port` |
 | 8 | `upgrades` | Install + escreve `20auto-upgrades` + enable service | — |
+| 9 | `sentinel` | Opt-in. Descarrega `<central>/downloads/sentinel-agent[-arm64].deb`, pede *install key* (`ik_`, single-use) em runtime, `POST <central>/api/agents/register` → token → `/etc/sentinel/agent.toml` (0600), `systemctl enable --now sentinel-agent`. Pull-only HTTPS, não abre portas. Idempotente: se `agent.toml` existe não re-regista | `sentinel.central_url`, `modules.sentinel` |
 
 Cada módulo regista-se em `state.yaml::installed_modules` após sucesso.
 `validate` só faz checks contra módulos com flag — outros aparecem como `[--]`.
@@ -295,7 +328,6 @@ Comandos não-modulares:
 Sub-cmds especiais:
 - `erp24 timesync sync` — força re-sync (restart timesyncd)
 - `erp24 timesync status` — `timedatectl status`
-- `erp24 status [--live]` — host metrics (CPU/RAM/disk/network). Operator-class.
 
 ---
 
@@ -316,8 +348,9 @@ erp24 port remove <P>/<PROTO>          # fechar + remover de state
 erp24 port allow <P>/<PROTO> <IP>      # ALLOW from IP só nessa porta
 erp24 port revoke <P>/<PROTO> <IP>     # DELETE allow from IP só nessa porta
 erp24 port list                        # tabela: portas geridas + sources UFW
-erp24 firewall|ssh|docker|fail2ban|upgrades|timesync|sysctl|hostname
+erp24 firewall|ssh|docker|fail2ban|upgrades|timesync|sysctl|hostname|sentinel
 erp24 timesync sync|status
+erp24 status [--live]                  # métricas do host
 ```
 
 Flags globais:
@@ -343,18 +376,22 @@ Dois papéis. Decididos em runtime, não persistidos.
   rejeitado por `RequireAdmin()` em `cmd/root.go`.
 
 `RequireAdmin()` está aplicado em: firewall, ssh, docker, fail2ban,
-upgrades, sysctl, hostname, init, add-ip, remove-ip, port add/remove/
-allow/revoke. Operator-class cmds usam só `runner.RequireRoot()`.
+upgrades, sysctl, hostname, sentinel, init, add-ip, remove-ip, port
+add/remove/allow/revoke. Operator-class cmds usam só `runner.RequireRoot()`.
 
 dev24 (ou seja qual for `ssh.user`) **NÃO** está no grupo sudo. Único
 caminho de privilégio é via `/etc/sudoers.d/erp24` (NOPASSWD blanket em
 `/usr/sbin/erp24`) e a verificação em-app filtra por subcmd. Para
 operações destrutivas: real root login (não há atalho via sudo).
 
-Menu `Add port` é simplificado: só pede PORT/PROTO + label, assume
-`kind=docker` + aberta a todos (caso comum: expor container). `--host`
-(serviço host, INPUT) e `--restrict` (fechada, grant per-IP) ficam só via
-CLI `erp24 port add`.
+Menu Network é **secure-by-default** (assume `kind=docker`):
+- "Abrir porta a 1+ IP (bloqueia o resto)" — o caminho normal: regista a
+  porta fechada (`restrict`) e abre-a só aos IP/CIDR indicados; nunca passa
+  por Anywhere. Sem IPs a porta fica registada mas FECHADA.
+- "Abrir porta a TODOS (Anywhere)" — só com confirmação explícita
+  (default "não").
+- Fechar porta, adicionar/remover IP a uma porta ou a TODAS.
+`--host` (serviço host, INPUT) fica só via CLI `erp24 port add`.
 
 Menu: navegação unificada com `x` (recua em submenus, sai no top-level —
 nunca há overlap p.q. submenu não tem ponto de saída e top-level não tem
@@ -388,7 +425,9 @@ Notas:
   não exponha nada ao mundo sem regra UFW correspondente.
 - Para expor porta de container: `erp24 port add <PORT>/tcp <LABEL>` (default
   kind=docker → `ufw route allow`). Whitelist por IP via
-  `erp24 port allow <PORT>/tcp <IP>`.
+  `erp24 port allow <PORT>/tcp <IP>`. Remover regra route é
+  `ufw route delete allow ...` (não `ufw delete route ...`, que é inválido).
+- Traefik com httpchallenge precisa de 80/443 abertos a TODOS.
 - **Não** dar acesso ao grupo `docker` a users não-root — é equivalente a
   root sem audit trail.
 
@@ -427,6 +466,7 @@ quando publica porta. Tráfego docker passa por FORWARD, não INPUT.
 *filter
 :ufw-user-forward - [0:0]
 :DOCKER-USER - [0:0]
+-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
 -A DOCKER-USER -j ufw-user-forward
 -A DOCKER-USER -j RETURN -s 10.0.0.0/8
 -A DOCKER-USER -j RETURN -s 172.16.0.0/12
@@ -434,6 +474,16 @@ quando publica porta. Tráfego docker passa por FORWARD, não INPUT.
 -A DOCKER-USER -j DROP
 COMMIT
 ```
+
+A 1ª regra (ESTABLISHED,RELATED) é **obrigatória**: sem ela as respostas
+a ligações que os próprios containers abrem (SYN-ACK de um IP público)
+caem no DROP e todo o outbound TCP dos containers dá timeout (ACME do
+Traefik, S3, ...). Corrigido na 0.6.9 — **nunca** correr `erp24 firewall`
+com um binário anterior (reescreve o bloco sem a regra). Desbloqueio
+efémero num servidor antigo:
+`iptables -I DOCKER-USER 1 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN`.
+
+Só existe para IPv4 (`after.rules`); falta `after6.rules` (pendente).
 
 Efeito: DOCKER-USER salta para `ufw-user-forward` (onde `ufw route allow`
 mete regras). Tráfego docker→docker (private LAN) faz RETURN cedo, externo
@@ -490,28 +540,39 @@ go build -ldflags "-X main.version=0.1.0" -o erp24 .   # com versão
 GOOS=linux GOARCH=amd64 go build -o erp24-linux .      # cross-compile
 ```
 
-### CI (`.github/workflows/release.yml`)
+### Release (MyPublisher — `.mypublisher/workflows/producao.yml`)
 
-- Trigger: `workflow_dispatch` com inputs `version` (sem `v`) + `branch`.
-- Matrix: amd64 + arm64.
-- Build estático Go (`CGO_ENABLED=0`).
-- **Package/comando/binário/paths = `erp24`** (renomeado de `lsm`). Motivo:
-  existe um pacote oficial Debian chamado `lsm` ("Link connectivity monitor",
-  transitional p/ `foolsm`); ter o nosso pacote também `lsm` fazia `apt install
-  lsm` substituí-lo e apagar o binário. `erp24` não colide com nada no repo
-  Debian. Tudo é `erp24` agora: `/usr/sbin/erp24`, `/etc/erp24/`,
-  `/usr/local/bin/erp24`, comando `erp24`.
-- Empacota com `dpkg-deb --build`:
-  - Binário → `/usr/sbin/erp24`
-  - Config exemplo → `/etc/erp24/config.example.yaml`
-  - README → `/usr/share/doc/erp24/README.md`
-- Dois assets por arch: `erp24_<version>_<arch>.deb` (immutable) + `erp24_<arch>.deb` (alias para `releases/latest/download/`).
-- Release notes auto + body custom com one-liner de install.
-- Tag `vX.Y.Z` criada automaticamente.
+Já não é GitHub Actions (`.github/` foi apagada em ago-2026). O MyPublisher
+corre localmente (Windows/Git Bash ou Mac) no branch `master`:
+
+1. `version/resolve` — versão pedida na UI (sugere o próximo patch).
+2. Build — para amd64 + arm64: `CGO_ENABLED=0 go build -trimpath
+   -ldflags "-s -w -X main.version=$VERSION" -o bin/erp24 .` e
+   `nfpm pkg --packager deb` (config em `nfpm.yaml`; nfpm instalado via
+   `go install` se faltar). Gera `dist/erp24_<version>_<arch>.deb` +
+   alias `dist/erp24_<arch>.deb` (para `releases/latest/download/`).
+3. `git/tag` — tag **sem prefixo `v`** (desde 0.4.1; as `v0.x` antigas ficam).
+4. `github/release` — notes auto + os 4 `.deb`.
+
+Conteúdo do pacote (`nfpm.yaml`): binário → `/usr/sbin/erp24`,
+`config.example.yaml` → `/etc/erp24/` (não é conffile — atualiza sempre),
+README → `/usr/share/doc/erp24/`, postinst `packaging/postinstall.sh`.
+
+**CRLF**: como o MyPublisher pode correr em Windows, o `postinstall.sh` com
+CRLF partia o postinst (`#!/bin/bash\r`). Proteções: `.gitattributes`
+(`*.sh`/`*.service eol=lf`) + `tr -d '\r'` no `producao.yml` antes do nfpm.
+Não remover.
+
+Nome do pacote = `erp24` (renomeado de `lsm`: existe um pacote Debian
+oficial `lsm` e `apt install lsm` substituía-o).
+
+Ao re-descarregar o `.deb` com `wget`, apagar primeiro (`rm -f erp24_*.deb`)
+— senão fica `.deb.1` e o apt instala o antigo.
 
 ### Postinst behavior
 
-Distingue install fresco (`$2` vazio) vs upgrade (`$2 = OLD_VERSION`):
+`packaging/postinstall.sh` (versão via `dpkg-query`). Distingue install
+fresco (`$2` vazio) vs upgrade (`$2 = OLD_VERSION`):
 
 - **Fresh**: imprime paths + `sudo erp24` next step.
 - **Upgrade**: imprime "X → Y" + sugere `diff config vs example` + `sudo erp24 validate`.
@@ -536,6 +597,7 @@ Distingue install fresco (`$2` vazio) vs upgrade (`$2 = OLD_VERSION`):
 | `/etc/apt/apt.conf.d/20auto-upgrades` | unattended-upgrades periodic | erp24 upgrades |
 | `/etc/sudoers.d/erp24` | NOPASSWD blanket em `/usr/sbin/erp24` ao SSH user | erp24 ssh |
 | `/etc/ssh/sshd_config.d/99-erp24.conf` | sshd Port + PermitRootLogin no + PasswordAuthentication yes | erp24 ssh |
+| `/etc/sentinel/agent.toml` | config + token do agente Sentinel (0600) | erp24 sentinel |
 | `/etc/needrestart/conf.d/99-erp24.conf` | needrestart em modo list-only (sem dialog interativo no apt) | erp24 system update |
 | `/home/<ssh.user>/.profile` (bloco marcado) | auto-launch do menu no login interativo | erp24 bootstrap |
 | `/usr/share/doc/erp24/README.md` | docs | dpkg |
@@ -547,8 +609,11 @@ Distingue install fresco (`$2` vazio) vs upgrade (`$2 = OLD_VERSION`):
 - **Email**: pedro.santos@erp24.pt
 - **Idioma**: PT (mensagens, prompts, README, este doc).
 - **Plataforma dev**: macOS (darwin/arm64). Server target: Debian linux.
-- **Conta GitHub**: vai criar repo próprio para isto.
-- **Estilo de comunicação**: terse (caveman mode ativo na conversa). Resposta seca e direta. Sem fluff/preâmbulos.
+- **GitHub**: santospedro1993/LittleServerManager (público).
+- **Estilo de comunicação**: resposta seca e direta. Sem fluff/preâmbulos.
+- **Go fora do PATH** em shells não-interativos: `export PATH="$PATH:/usr/local/go/bin"`.
+  Validar com `go build ./... && go vet ./... && go test ./...`. Não há Debian
+  local — lógica de servidor só se prova no servidor real.
 - **Fluxo**: faz perguntas curtas, prefere ver opções com trade-offs antes de decidir, depois manda implementar. Aprecia validate/dry-run.
 
 ---
@@ -562,7 +627,7 @@ Distingue install fresco (`$2` vazio) vs upgrade (`$2 = OLD_VERSION`):
 - **Wizard cresce com config**. Campo novo → prompt no wizard.
 - **`config.example.yaml`** tem de espelhar o schema atual (é o template que vai para `/etc/erp24/`).
 - **CLI deve continuar a funcionar sem args** → menu. `erp24 all -y` deve funcionar sem prompts.
-- **Não partir o postinst/control do .deb** sem testar (`dpkg-deb --build` + `--info` + `--contents`).
+- **Não partir o postinst / `nfpm.yaml`** sem testar (`nfpm pkg` + `dpkg-deb --info`/`--contents` do resultado).
 - **Versão é injetada via ldflags** — `main.version` é `"dev"` se não for set.
 
 ---
@@ -578,13 +643,15 @@ Distingue install fresco (`$2` vazio) vs upgrade (`$2 = OLD_VERSION`):
 
 ---
 
-## 17b. TODO — bugs/melhorias notados em revisão (2026-05-07)
+## 17b. TODO — bugs/melhorias notados em revisão (2026-05-07, revisto 2026-10-16)
 
 Lista de coisas detetadas em full review pós-refactor. Não bloqueiam; correr quando houver tempo.
 
 ### Bugs com risco real
 
-- [ ] **`portRevoke` reabre a TODOS automaticamente** quando o último IP específico sai E a porta não estava `Anywhere`. Se user adicionou via `port add --restrict` e revoga o último IP, ficaria fechado mas vamos reabrir. Footgun. Fix: detetar intent original via state.ManagedPort.RestrictMode ou perguntar antes de reabrir.
+- [x] ~~**`portRevoke` reabre a TODOS automaticamente**~~ — resolvido: agora só remove e avisa que a porta fica fechada.
+- [ ] **IPv6 cego em `allowedSourcesForDirection`** (`internal/ufw`): salta linhas `(v6)` → `IsOpenToAll`/`IsRouteOpenToAll` não veem um Anywhere só-IPv6 se v4/v6 dessincronizarem.
+- [ ] **Bloco DOCKER-USER só em `after.rules`** — falta o equivalente em `after6.rules`.
 - [ ] **Validate de managed ports não associa o FAIL ao módulo dono.** `currentModule = ""` antes do loop de portas. "Check & Fix" não pode reaplicar. Fix: associar SSH port → ssh module; portas custom → não auto-fix.
 - [ ] **Wizard não rejeita usernames perigosos** (`root`, users existentes em uso). Pode mexer em accounts não-erp24. Fix: validar contra `getent passwd` + lista de reserved.
 - [ ] **`fail2ban` validate só checka active**, não confirma jail SSH carregado. Pode estar "active" sem proteger nada. Fix: parse `fail2ban-client status sshd`.
@@ -606,7 +673,6 @@ Lista de coisas detetadas em full review pós-refactor. Não bloqueiam; correr q
 - [ ] Adicionar **wireguard** module (configurável ou peer-only).
 - [ ] Adicionar **ssh-keys** module (deploy authorized_keys + opção desligar PasswordAuth).
 - [ ] Adicionar **backup** subcmd (tar de config+state+ufw+sshd drop-in).
-- [ ] Considerar **`port add --restrict` registar intent** em `state.ManagedPort.OpenPolicy` (`open|restricted`) para `portRevoke` saber se reabre ou não.
 - [ ] Considerar adicionar `erp24 doctor` que corre validate + dependency-check.
 - [ ] Adicionar suporte a IPv6 nas regras UFW (`ufw status` IPv6 entries são skipped agora; user pode querer add-ip de IPv6).
 

@@ -31,7 +31,7 @@ network:
 # here — the install key is asked at install time and the agent token is written
 # to /etc/sentinel/agent.toml. Neither secret is ever stored in this file.
 sentinel:
-  central_url: https://sentinel.erp24.pt
+  central_url: https://cc.erp24.pt
 
 # Which optional modules to install on `erp24 all` and on the post-wizard run.
 # firewall and ssh are always enabled (security baseline). The rest reflect
